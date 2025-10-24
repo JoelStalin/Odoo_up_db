@@ -1,95 +1,131 @@
 #!/bin/bash
 
-# Función para manejar errores
+# ===============================
+# Script de migración PostgreSQL
+# Backup al inicio y al final
+# Autor: OpenAI - ChatGPT
+# Versión: Octubre 2025 (Modificado)
+# ===============================
+
+# 🛠️ CONFIGURACIÓN INICIAL
+ODOO_DB="contabilidad"                  # ⚠️ Cambia este nombre si tu base es distinta
+DB_USER="odoo-v14"                      # Usuario PostgreSQL
+DB_PASSWORD="Y72G2UdW2wIu9FSK"          # ⚠️ Clave PostgreSQL (¡No recomendado en scripts!)
+DB_HOST="172.17.0.1"                    # IP donde corre PostgreSQL (usado por Odoo en Docker)
+DB_PORT="5432"                          # Puerto PostgreSQL
+BACKUP_DIR="/home/ubuntu/backups/"      # Ruta de backups
+
+# Versiones a migrar (ordenadas)
+versions=(13 14 15 16 17)
+
+# Crear carpeta de backups si no existe
+mkdir -p "$BACKUP_DIR"
+
+# 💥 Manejo de errores
 handle_error() {
     echo "❌ Error en la línea $1"
     exit 1
 }
-
-# Atrapar errores
 trap 'handle_error $LINENO' ERR
 
-# Leer versiones desde el usuario
-read -p "¿Cuál es la versión ACTUAL de PostgreSQL (por ejemplo, 12)? " source_version
-read -p "¿A qué versión deseas actualizar PostgreSQL (por ejemplo, 17)? " target_version
+# ✅ Función para realizar backup de una base específica
+make_odoo_backup() {
+    local version_tag=$1
+    local timestamp=$(date +%F_%H%M%S)
+    local backup_file="$BACKUP_DIR/Backup-v${version_tag}-${ODOO_DB}-$timestamp.sql"
+    local host_to_use="$DB_HOST"
 
-# Validar que ambas sean números enteros
-if ! [[ "$source_version" =~ ^[0-9]+$ && "$target_version" =~ ^[0-9]+$ ]]; then
-    echo "❌ Ambas versiones deben ser números enteros."
-    exit 1
-fi
+    echo "🛡️ Creando backup de la base '$ODOO_DB' (marcado como v$version_tag)..."
 
-# Validar que la versión destino sea mayor que la actual
-if (( target_version <= source_version )); then
-    echo "❌ La versión destino ($target_version) debe ser mayor que la actual ($source_version)."
-    exit 1
-fi
+    # Verificar conexión al host actual
+    if ! nc -z -w3 "$DB_HOST" "$DB_PORT" 2>/dev/null; then
+        echo "⚠️ No se pudo conectar a $DB_HOST:$DB_PORT. Usando localhost como fallback..."
+        host_to_use="localhost"
+    fi
 
-# ========================
-# Paso 1: Configurar repositorio oficial de PostgreSQL (si no está presente)
-# ========================
-echo "🔍 Verificando repositorio oficial de PostgreSQL..."
-if ! grep -q "apt.postgresql.org" /etc/apt/sources.list /etc/apt/sources.list.d/*; then
-    echo "➕ Agregando repositorio oficial de PostgreSQL..."
+    # Exportar password para pg_dump
+    export PGPASSWORD="$DB_PASSWORD"
 
-    sudo apt install -y curl ca-certificates gnupg lsb-release
+    # Ejecutar pg_dump solo de la base de Odoo
+    pg_dump \
+        -h "$host_to_use" \
+        -p "$DB_PORT" \
+        -U "$DB_USER" \
+        -F p \
+        -d "$ODOO_DB" \
+        -f "$backup_file"
 
-    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | \
-        sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg
+    if [[ $? -eq 0 ]]; then
+        echo "✅ Backup creado en: $backup_file"
+    else
+        echo "❌ Error al crear backup para la base $ODOO_DB (marcado como v$version_tag)"
+        exit 1
+    fi
+}
 
-    echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | \
-        sudo tee /etc/apt/sources.list.d/pgdg.list
+# 🚀 Iniciar migración
 
-    sudo apt update
-else
-    echo "✅ Repositorio de PostgreSQL ya está configurado."
-    sudo apt update
-fi
+# 🗂️ 1. Backup INICIAL (antes de CUALQUIER migración)
+# Se usa la versión "actual" antes de la primera migración (13-1 = 12)
+first_version=$((versions[0] - 1)) 
+echo "-----------------------------------------------"
+echo "🛡️ Creando backup INICIAL de PostgreSQL v$first_version..."
+make_odoo_backup "$first_version"
+echo "-----------------------------------------------"
 
-# ========================
-# Paso 2: Iterar versiones e ir actualizando paso a paso
-# ========================
-for (( version = source_version + 1; version <= target_version; version++ )); do
-    current_version=$((version - 1))
-    echo "🚀 === Actualizando de PostgreSQL $current_version a $version ==="
 
-    # Verificar que la versión de origen está instalada
+for target_version in "${versions[@]}"; do
+    current_version=$((target_version - 1))
+    echo "🔄 Migrando de PostgreSQL $current_version a $target_version..."
+
+    # Verificar si la versión actual está instalada
     if ! dpkg -l | grep -q "postgresql-$current_version"; then
-        echo "❌ PostgreSQL $current_version no está instalado. Abortando."
+        echo "⚠️ PostgreSQL $current_version no está instalado. Saliendo."
         exit 1
     fi
 
-    # Instalar la nueva versión
-    echo "📦 Instalando PostgreSQL $version..."
-    sudo apt install -y "postgresql-$version"
+    # --- La llamada al backup dentro del bucle ha sido eliminada ---
 
-    # Eliminar el clúster predeterminado (si existe)
-    if pg_lsclusters | grep -q "$version.*main"; then
-        echo "🗑️ Eliminando clúster por defecto de $version..."
-        sudo pg_dropcluster --stop "$version" main
+    # Instalar nueva versión
+    echo "📦 Instalando PostgreSQL $target_version..."
+    sudo apt update
+    sudo apt install -y "postgresql-$target_version"
+
+    # Eliminar clúster por defecto (si existe)
+    if pg_lsclusters | grep -q "$target_version.*main"; then
+        echo "🧹 Eliminando clúster por defecto de $target_version..."
+        sudo pg_dropcluster --stop $target_version main
     fi
 
-    # Migrar el clúster
-    echo "🔄 Migrando clúster de $current_version a $version..."
-    sudo pg_upgradecluster -v "$version" "$current_version" main
+    # Realizar upgrade del clúster
+    echo "🔧 Ejecutando pg_upgradecluster..."
+    sudo pg_upgradecluster -v $target_version $current_version main
 
-    # Verificar que el nuevo clúster esté activo
-    if pg_lsclusters | grep -q "$version.*main.*online"; then
-        echo "✅ Clúster $version está en línea."
+    # Verificar si el clúster subió correctamente
+    if pg_lsclusters | grep -q "$target_version.*main.*online"; then
+        echo "✅ PostgreSQL $target_version está activo y funcionando."
     else
-        echo "❌ Fallo al activar clúster $version. Revisa los logs."
+        echo "❌ Error al iniciar clúster de $target_version. Verifica logs."
         exit 1
     fi
 
     # Eliminar clúster anterior
-    echo "🧹 Eliminando clúster de $current_version..."
-    sudo pg_dropcluster "$current_version" main
+    echo "🗑️ Eliminando clúster PostgreSQL $current_version..."
+    sudo pg_dropcluster $current_version main
 
-    # (Opcional) Eliminar paquetes anteriores
-    echo "🧼 Eliminando paquetes de PostgreSQL $current_version..."
+    # Opcional: eliminar paquete viejo
+    echo "🧽 Eliminando paquetes PostgreSQL $current_version..."
     sudo apt purge -y "postgresql-$current_version" "postgresql-client-$current_version"
 
-    echo "✅ Actualización a PostgreSQL $version completada."
+    echo "✅ Migración a PostgreSQL $target_version completada."
+    echo "-----------------------------------------------"
 done
 
-echo "🎉 Todas las actualizaciones desde PostgreSQL $source_version hasta $target_version se completaron con éxito."
+# 🗂️ 2. Backup FINAL (después de TODAS las migraciones)
+# Se usa la última versión de la lista (17)
+last_version=${versions[-1]} 
+echo "🛡️ Creando backup FINAL de PostgreSQL v$last_version..."
+make_odoo_backup "$last_version"
+echo "-----------------------------------------------"
+
+echo "🎉 Migración completa. Todos los upgrades han sido aplicados correctamente."
