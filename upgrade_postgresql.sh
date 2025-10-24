@@ -129,3 +129,4 @@ make_odoo_backup "$last_version"
 echo "-----------------------------------------------"
 
 echo "🎉 Migración completa. Todos los upgrades han sido aplicados correctamente."
+#test
